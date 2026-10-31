@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/cmux-pty-port", "crates/cmux-testsupport", "crates/cmux-shell", "crates/cmux-layout", "crates/cmux-config", "crates/cmux-workspaces", "crates/cmux-toast", "crates/cmux-ipc", "crates/cmux-hooks", "crates/cmux-cli", "crates/cmux-webview2"]
+
+# The vendor patches every workspace member's `egui_tty` dependency (see
+# crates/egui_tty/VENDORED.md — mouse reporting is wired inside the widget).
+[patch.crates-io]
+egui_tty = { path = "crates/egui_tty" }
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+
+# Shared profile tuning happens here later; defaults are correct for M0.

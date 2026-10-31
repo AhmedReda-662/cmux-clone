@@ -1,0 +1,60 @@
+// cmux config — JSONC: `//` comments and trailing commas are allowed.
+// Missing keys fall back to their defaults; unknown keys are ignored.
+
+{
+  "appearance": {
+    // Magnification percent for the terminal (and any UI) font.
+    // Range 50–300 when applied.
+    "fontMagnificationPercent": 100
+  },
+
+  "panes": {
+    // Gutter in pixels between neighboring panes.
+    "gutter": 12.0,
+    // Pixels per step for keyboard pane resizing.
+    "resizeStep": 40
+  },
+
+  "terminal": {
+    // Custom shell for new panes, e.g.
+    // { "program": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+    //   "args": ["-NoLogo"] }
+    // Omit (or leave null) to use the Windows default shell.
+    "shell": null
+  },
+
+  "theme": {
+    // Terminal scheme: "dark" or "light" (null keeps dark). Window
+    // chrome and gutters follow `background`; the cells follow the
+    // scheme's built-in dark/light colors.
+    "scheme": null,
+    // Window chrome background as #rrggbb (pane area + gutters).
+    "background": null,
+    // Terminal cursor color as #rrggbb (when the program has not
+    // asked for its own).
+    "cursor": null
+  },
+
+  "notifications": {
+    // Skip the toast while cmux is the focused window (upstream
+    // notifications.suppressWhenAppFocused; the ring still updates).
+    "suppressWhenAppFocused": false,
+    // Play the notification sound even when the notifying pane is
+    // already focused (upstream notifications.soundWhenFocused).
+    "soundWhenFocused": false
+  },
+
+  "shortcuts": {
+    // `bindings`: action id → shortcut. A string like "ctrl+shift+r",
+    // a two-element array for a chord, or null to unbind the action.
+    // Tokens: ctrl, shift, alt, win/cmd (see cmux docs), plus a key such
+    // as a letter, digit, tab, or arrow. Not applied (yet): chords.
+    "bindings": {
+      "splitRight": "ctrl+shift+r",
+      "splitDown": "ctrl+shift+d",
+      "closePane": "ctrl+shift+w",
+      "focusNextPane": "ctrl+tab",
+      "focusPreviousPane": "ctrl+shift+tab"
+    }
+  }
+}
