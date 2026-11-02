@@ -12,7 +12,7 @@ This directory contains the WiX-based MSI installer for the cmux Windows port.
      - `cmux-shell.exe` — Main application
      - `conpty.dll` — Bundled ConPTY runtime
      - `OpenConsole.exe` — ConPTY console helper
-     - `cmux-cli.exe` — CLI control tool
+     - `cmux.exe` — CLI control tool
 
 ## Building the MSI
 
@@ -41,7 +41,7 @@ cd port
 cp target/release/cmux-shell.exe installer/
 cp target/release/conpty.dll installer/
 cp target/release/OpenConsole.exe installer/
-cp target/release/cmux-cli.exe installer/
+cp target/release/cmux.exe installer/
 
 # 2. Compile WiX source
 cd installer
@@ -107,19 +107,19 @@ The MSI installs to `C:\Program Files\cmux\`:
 | File | Purpose |
 |------|---------|
 | `cmux-shell.exe` | Main terminal application |
-| `conpty.dll` | Bundled ConPTY runtime (newer than in-box) |
+| `cmux.exe` | CLI control tool (crate bin name is load-bearing — hooks rules match `\cmux.exe`) |
+| `conpty.dll` | Bundled ConPTY redistributable pair (NuGet 1.24.260710001, MIT — see `port/third_party/conpty/ORIGIN.md`) |
 | `OpenConsole.exe` | ConPTY console helper |
-| `cmux-cli.exe` | CLI control tool |
 | `cmux.json.template` | Default config template |
-| `LICENSE` | GPL-3.0 license |
+| `NOTICES.txt` | Third-party notices for the shipped binaries |
 
 ### Shortcuts Created
 - Start Menu: `cmux` → `cmux-shell.exe`
-- Desktop: `cmux` (optional, can be disabled)
+- Desktop: `cmux` (feature-controlled)
+- Start Menu: `Uninstall cmux`
 
 ### Registry
-- `HKCU\Software\Manaflow\cmux` — Install tracking
-- `CMUX_CONFIG_FILE` environment variable (system-wide)
+- `HKCU\Software\cmux-clone\cmux` — per-component install tracking
 
 ## Configuration
 

@@ -272,6 +272,51 @@ Ordinary-tooling runtime observation — **no REA Evidence involved**.
     mangle risk documented as the Windows analogue of upstream's zsh
     shim caveats.
 
+## Q8 — Does the ConPTY host deliver child mouse-reporting to the emulator, and what does the bundled 1.24 pair change? (round 10)
+
+Context: the port's mouse-reporting feature (egui_tty's SGR encoder, HUD
+battery round 10) is only meaningful if a child's `?1000h`/`?1006h` requests
+reach the VT engine. Method: standalone stage probes
+(`port/harness/conpty_mouse_stage1.py`, a ConPTY around one child, with and
+without `--dll port/third_party/conpty/conpty.dll`) plus the in-app battery
+`port/harness/test_terminal_mouse_r10.py`. Ordinary-tooling runtime
+observation — no REA Evidence capture involved (see ADR-0003 verification
+on REA's Windows PTY capture limitation).
+
+- **Observations (round-10 sessions, 2026-10-27; stage probes re-checked
+  when the review round re-runs them):**
+  - The **stock host** (kernel32 in-box conhost) does not pass the child's
+    mouse-mode requests through on the output side: with no `--dll`, the
+    emulator side never observes `?1000h/?1006h` enable traffic the child
+    wrote (stage-1, tag `kernel32`).
+  - The **bundled 1.24 host** (`conpty.dll` sideload, tag `conptydll`)
+    delivers the requests through to the PTY stream (stage-1 receipt;
+    ADR-0017). Image/version/nuspec identity receipts for the pair are in
+    `port/third_party/conpty/ORIGIN.md` (PE32+ x64, 1.24.2607.10001,
+    NuGet `Microsoft.Windows.Console.ConPTY/1.24.260710001`).
+  - App battery `test_terminal_mouse_r10.py` at last run (superseded by the
+    packaging round, before this entry was written): **Leg B PASSED** (drag
+    ink over the shell pane reaches the renderer), **Leg A = 0 in-pane TUI
+    records — unresolved** at that point. Probe-side fixes landed with the
+    round: `ping_and_hwnd` + `focus_surface` reuse the R9
+    ClientSurface → foreground → pin idiom, click sites stay ≤512 pt inside
+    the 640 px window, and `mouse_tui_records.py`'s `describe()` now reads
+    KEY_EVENT unions as `uChar.UnicodeChar` (not `.value` — that failed
+    heap reads silently).
+  - A temporary `R10_NO_RESIZE` branch exists in `test_terminal_mouse_r10.py`
+    for the battery's retry matrix; remove it only after Leg A re-baselines.
+- **Classification:** stage-1 pass-through difference and pair identity =
+  verified facts (two-host A/B probe on this machine). Leg A end-to-end
+  (probe click → app renderer → child record) = **unknown at the time this
+  entry was written** (last recorded battery run predates it); re-baseline
+  is scheduled in the packaging-review round, and this section is updated
+  by that run.
+- **Design impact:** the mouse-reporting decision chain is (1) bundle the
+  1.24 pair (ADR-0017) so the host cannot swallow the child's modes, (2)
+  rely on egui_tty's in-widget SGR encoder + ConPTY's INPUT_RECORD bridge
+  to turn real OS clicks into SGR bytes, (3) re-baseline the battery before
+  claiming in-app end-to-end parity. Re-verification receipts land here.
+
 ## Open questions
 
 - None currently assigned to REA. Candidate future questions: compare built

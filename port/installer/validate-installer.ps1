@@ -67,18 +67,18 @@ try {
         "cmux-shell.exe",
         "conpty.dll",
         "OpenConsole.exe",
-        "cmux-cli.exe",
+        "cmux.exe",
         "cmux.json.template",
-        "LICENSE"
+        "NOTICES.txt"
     )
     
     $allFound = $true
     foreach ($file in $requiredFiles) {
         $found = Get-ChildItem -Recurse -File -Filter $file $tempDir -ErrorAction SilentlyContinue
         if ($found) {
-            Write-Host "  [✓] $file" -ForegroundColor Green
+            Write-Host "  [OK] $file" -ForegroundColor Green
         } else {
-            Write-Host "  [✗] $file (MISSING)" -ForegroundColor Red
+            Write-Host "  [MISSING] $file (MISSING)" -ForegroundColor Red
             $allFound = $false
         }
     }

@@ -69,16 +69,16 @@ $requiredFiles = @(
     "cmux-shell.exe",
     "conpty.dll",
     "OpenConsole.exe",
-    "cmux-cli.exe"
+    "cmux.exe"
 )
 
 $allFound = $true
 foreach ($file in $requiredFiles) {
     $path = Join-Path $BuildDir $file
     if (Test-Path $path) {
-        Write-Host "  [✓] $file" -ForegroundColor Green
+        Write-Host "  [OK] $file" -ForegroundColor Green
     } else {
-        Write-Host "  [✗] $file (not found - run 'cargo build --release' in port/)" -ForegroundColor Red
+        Write-Host "  [MISSING] $file (not found - run 'cargo build --release' in port/)" -ForegroundColor Red
         $allFound = $false
     }
 }
@@ -90,14 +90,6 @@ if (-not $allFound) {
 # Create output directory
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
-# Copy build artifacts to installer directory for WiX
-Write-Host ""
-Write-Host "Staging files for WiX..." -ForegroundColor Yellow
-Copy-Item -Path (Join-Path $BuildDir "cmux-shell.exe") -Destination $InstallerDir -Force
-Copy-Item -Path (Join-Path $BuildDir "conpty.dll") -Destination $InstallerDir -Force
-Copy-Item -Path (Join-Path $BuildDir "OpenConsole.exe") -Destination $InstallerDir -Force
-Copy-Item -Path (Join-Path $BuildDir "cmux-cli.exe") -Destination $InstallerDir -Force
-
 # Build WiX object file
 Write-Host ""
 Write-Host "Compiling WiX source..." -ForegroundColor Yellow
@@ -105,9 +97,9 @@ Set-Location $InstallerDir
 $sourceDir = Resolve-Path $InstallerDir
 $buildDirWin = Resolve-Path $BuildDir
 
-& candle.exe -dSourceDir="$sourceDir" `
+& candle.exe -arch x64 -dSourceDir="$sourceDir" `
     -dBuildDir="$buildDirWin" `
-    -dProductVersion="0.1.0" `
+    -dProductVersion="0.0.1" `
     cmux-installer.wxs `
     -out cmux-installer.wixobj
 
@@ -133,7 +125,7 @@ if ($Sign) {
     Write-Host ""
     Write-Host "Attempting to sign MSI..." -ForegroundColor Yellow
     
-    $signTool = $env:SIGNTOOL_PATH ?? "signtool.exe"
+    $signTool = if ($env:SIGNTOOL_PATH) { $env:SIGNTOOL_PATH } else { "signtool.exe" }
     $certThumbprint = $env:CERT_THUMBPRINT
     $pfxPath = $env:PFX_PATH
     $certPassword = $env:CERT_PASSWORD
@@ -156,5 +148,5 @@ Write-Host ""
 Write-Host "=== Build Complete ===" -ForegroundColor Cyan
 Write-Host "MSI: $msiPath" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Install with: msiexec /i `"$msiPath`""
-Write-Host "Uninstall with: msiexec /x {ProductCode}"
+Write-Host ('Install with: msiexec /i "' + $msiPath + '"')
+Write-Host ('Uninstall with: msiexec /x {ProductCode}')

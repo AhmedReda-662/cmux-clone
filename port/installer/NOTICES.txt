@@ -1,0 +1,46 @@
+cmux Windows port installer — third-party notices
+===================================================
+
+This MSI ships the cmux Windows port application (cmux-shell.exe, cmux.exe)
+built from the source in the project repository, together with the following
+third-party components. The complete dependency set for every binary is listed
+in port/Cargo.lock in the project repository.
+
+Bundled redistributable files
+-----------------------------
+conpty.dll, OpenConsole.exe
+    Microsoft's Windows Console (ConPTY) redistributable, taken from the
+    official NuGet package `Microsoft.Windows.Console.ConPTY`
+    version 1.24.260710001 (x64 pair verified against that package;
+    package manifest and origin notes: port/third_party/conpty/).
+    Source: microsoft/terminal project. License: MIT.
+
+Compiled into the application binaries
+--------------------------------------
+Ghostty VT engine (via libghostty-vt)
+    Ghostty's VT parser/screen engine compiled from source during the build.
+    License: MIT (upstream Ghostty), crate MIT OR Apache-2.0.
+
+egui_tty (vendored copy in port/crates/egui_tty)
+    Terminal emulator widget for egui. License: MIT.
+
+egui / eframe / egui_dock / wgpu
+    Immediate-mode GUI stack and rendering. License: MIT OR Apache-2.0.
+
+portable-pty 0.8.1 (wezterm)
+    Pseudoterminal management including Windows ConPTY. License: MIT.
+
+tokio
+    Async runtime. License: MIT.
+
+windows / windows-sys
+    Official Windows API bindings. License: MIT OR Apache-2.0.
+
+base64
+    Screenshot PNG decoding. License: MIT OR Apache-2.0.
+
+All further transitive dependencies ship under MIT OR Apache-2.0 terms; exact
+versions are pinned in port/Cargo.lock.
+
+The cmux Windows port application code is copyright the project owner; the
+project's own license is recorded in the project repository.

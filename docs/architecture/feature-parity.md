@@ -35,6 +35,7 @@ demonstrated check here.
 | 24 | Agent teams view (Claude Code teams) | README; `Sources/AgentInbox` | Optional (needs hooks+surface spawning) | spawn teammates as panes post-MVP |
 | 25 | Cloud VMs / remote relays / iOS | `web/`, `workers/`, `ios/` (BUSL dirs) | **NA for port scope** (server code, BUSL-licensed) | — |
 | 26 | Accessibility (VoiceOver, macOS AX) | `CmuxWindowing/Accessibility*` | M6 spike 2026-10-23 (ADR-0015): WidgetInfo labels landed on all chrome; OS UIA exposure verified-blocked on the probe rig (egui issue #8671 class; accesskit's own hello_world sample also placeholder-only) - eframe `accesskit` feature reverted to baseline | UIA tree exposes panes/tabs (canary lane harness/test_accessibility_uia.py flips SKIP to PASS when upstream/environment fix lands) |
+| 27 | Windows installer (MSI distribution) | — (macOS distributes an .app bundle; the port's equivalent artifact is an MSI) | **MVP subset landed 2026-11-01**: portable WiX 3.14.1.8722 (recipe: building-windows.md); `port/installer/cmux-installer.wxs` perMachine x64 (`ProgramFiles64Folder\cmux`, UpgradeCode `{5A3C8F2E-7B4D-4A1F-9E6C-2D8F1A7B3C9D}`, WixUI_Minimal) ships `cmux-shell.exe` + `cmux.exe` (the CLI's load-bearing exe name) + the bundled ConPTY pair (ADR-0017) + `cmux.json.template` (`Vital=no`) + third-party `NOTICES.txt`; Start Menu + desktop + uninstall shortcuts; `cmux-shell/build.rs` stages the pair next to dev-profile exes | machine MSI built (5.43 MB, zero ICE/compile errors) and validated by `validate-installer.ps1` admin extraction (all six payload files); **live install/uninstall smoke test, GitHub Release publication, code signing, and CI packaging remain**; live install smoke + license declaration for the port's own code are open owner items |
 
 Notes:
 - Classifications mirror the manifest's rule: preserve behavior unless a
@@ -59,6 +60,6 @@ Notes:
 | `/etc/shells`, `$SHELL`, `/bin/zsh` | registry/env shell discovery: `pwsh`, `cmd`, WSL, Git Bash (proven shell lists in NabiTerm/ZWG/wintty) | verified pattern |
 | `~/Library/Application Support`, `~/Library/Caches`, Keychain paths | `%APPDATA%/Roaming` config dir, `%LOCALAPPDATA%/Caches` equivalents (`directories` crate) | trivial, verify at impl |
 | UserDefaults settings store | cmux.json config file (reference already file-based) | direct |
-| Sparkle auto-update | MSI/winget + authored updater (later milestone) | deferred |
+| Sparkle auto-update | MSI **built + validated 2026-11-01** (parity row 27, machine-local; Release publication pending owner); winget manifest + authored updater deferred | partially landed |
 | Rosetta re-exec, fd soft-limit raise | not applicable | NA |
 | Xcode-specific test lanes | Windows CI lanes (GitHub Actions `windows-latest`) | planned |

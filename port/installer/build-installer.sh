@@ -54,7 +54,7 @@ REQUIRED_FILES=(
     "cmux-shell.exe"
     "conpty.dll"
     "OpenConsole.exe"
-    "cmux-cli.exe"
+    "cmux.exe"
 )
 
 for file in "${REQUIRED_FILES[@]}"; do
@@ -69,21 +69,13 @@ done
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Copy build artifacts to installer directory for WiX
-echo ""
-echo "Staging files for WiX..."
-cp "$BUILD_DIR/cmux-shell.exe" "$INSTALLER_DIR/"
-cp "$BUILD_DIR/conpty.dll" "$INSTALLER_DIR/"
-cp "$BUILD_DIR/OpenConsole.exe" "$INSTALLER_DIR/"
-cp "$BUILD_DIR/cmux-cli.exe" "$INSTALLER_DIR/"
-
 # Build WiX object file
 echo ""
 echo "Compiling WiX source..."
 cd "$INSTALLER_DIR"
-candle.exe -dSourceDir="$(cygpath -w "$INSTALLER_DIR")" \
+candle.exe -arch x64 -dSourceDir="$(cygpath -w "$INSTALLER_DIR")" \
     -dBuildDir="$(cygpath -w "$BUILD_DIR")" \
-    -dProductVersion="0.1.0" \
+    -dProductVersion="0.0.1" \
     cmux-installer.wxs \
     -out cmux-installer.wixobj
 

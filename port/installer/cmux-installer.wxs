@@ -2,30 +2,33 @@
 <!--
     cmux Windows Installer
     Generated for the cmux Windows port (M6 packaging milestone).
-    
+
     Build requirements:
     - WiX Toolset v3.14+ (candle.exe, light.exe)
     - Built cmux-shell.exe and dependencies in target/release/
-    
+
     Usage:
-    1. Build the project: `cd port && cargo build --release`
+    1. Build the port in the release profile from the port/ directory.
     2. Install WiX Toolset v3.14+ (https://github.com/wixtoolset/wix3/releases)
-    3. Build installer: `candle.exe cmux-installer.wxs -out cmux-installer.wixobj`
-    4. Link installer: `light.exe cmux-installer.wixobj -out cmux-installer.msi -ext WixUIExtension -cultures:en-us`
-    
+    3. Build: `.\installer\build-installer.ps1` (from port/)
+
     Code signing (when credentials available):
     - Set SIGNTOOL_PATH and CERT_THUMBPRINT environment variables
     - Or place .pfx file at signing/cert.pfx with CERT_PASSWORD env var
-    - Build will auto-detect and sign the MSI
-    
-    Unsigned MSI is fully functional when signing is unavailable.
+    - The build script signs the produced MSI file after light.exe links it.
+
+    Build variables consumed from candle:
+    - SourceDir: this installer/ directory (NOTICES.txt, cmux.json.template)
+    - BuildDir:  target/release directory (cmux-shell.exe, conpty.dll,
+                 OpenConsole.exe, cmux.exe)
 -->
 
-<?define ProductVersion = "0.1.0" ?>
+<?ifndef ProductVersion ?>
+<?define ProductVersion = "0.0.1" ?>
+<?endif?>
 <?define ProductName = "cmux" ?>
-<?define Manufacturer = "Manaflow AI" ?>
+<?define Manufacturer = "cmux-clone" ?>
 <?define UpgradeCode = "{5A3C8F2E-7B4D-4A1F-9E6C-2D8F1A7B3C9D}" ?>
-<?define InstallDir = "ProgramFiles64Folder\cmux" ?>
 
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="$(var.ProductName)" Language="1033" Version="$(var.ProductVersion)" Manufacturer="$(var.Manufacturer)" UpgradeCode="$(var.UpgradeCode)">
@@ -41,6 +44,7 @@
     <Feature Id="MainApplication" Title="cmux Terminal" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
       <ComponentRef Id="UninstallShortcut" />
     </Feature>
 
@@ -49,11 +53,11 @@
     <UIRef Id="WixUI_ErrorProgressText" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 
-    <!-- Properties -->
-    <Property Id="ARPNOMODIFY" Value="1" />
+    <!-- Properties. ARPNOMODIFY is set by WixUI_Minimal; declaring it here
+         too would duplicate the symbol at link time. -->
     <Property Id="ARPNOREPAIR" Value="1" />
-    <Property Id="ARPHELPLINK" Value="https://cmux.com/docs" />
-    <Property Id="ARPURLINFOABOUT" Value="https://cmux.com" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/AhmedReda-662/cmux-clone" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/AhmedReda-662/cmux-clone" />
 
     <!-- Installation directory -->
     <Directory Id="TARGETDIR" Name="SourceDir">
@@ -69,79 +73,65 @@
     <!-- Component Group: Product Files -->
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
       <!-- Main executable -->
-      <Component Id="cmux-shell.exe" Guid="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}">
-        <File Id="cmux-shell.exe" Source="$(var.BuildDir)\cmux-shell.exe" KeyPath="yes" Vital="yes" Checksum="yes" />
+      <Component Id="CmuxShellApp" Guid="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}">
+        <File Id="CmuxShellExe" Source="$(var.BuildDir)\cmux-shell.exe" KeyPath="yes" Vital="yes" Checksum="yes" />
       </Component>
 
       <!-- ConPTY bundled runtime -->
-      <Component Id="conpty.dll" Guid="{B2C3D4E5-F6A7-8901-BCDE-F12345678901}">
-        <File Id="conpty.dll" Source="$(var.BuildDir)\conpty.dll" KeyPath="yes" Vital="yes" Checksum="yes" />
+      <Component Id="ConPtyRuntime" Guid="{B2C3D4E5-F6A7-8901-BCDE-F12345678901}">
+        <File Id="ConPtyDll" Source="$(var.BuildDir)\conpty.dll" KeyPath="yes" Vital="yes" Checksum="yes" />
       </Component>
 
-      <Component Id="OpenConsole.exe" Guid="{C3D4E5F6-A7B8-9012-CDEF-123456789012}">
-        <File Id="OpenConsole.exe" Source="$(var.BuildDir)\OpenConsole.exe" KeyPath="yes" Vital="yes" Checksum="yes" />
+      <Component Id="OpenConsoleHelper" Guid="{C3D4E5F6-A7B8-9012-CDEF-123456789012}">
+        <File Id="OpenConsoleExe" Source="$(var.BuildDir)\OpenConsole.exe" KeyPath="yes" Vital="yes" Checksum="yes" />
       </Component>
 
-      <!-- CLI tool -->
-      <Component Id="cmux-cli.exe" Guid="{D4E5F6A7-B8C9-0123-DEFA-234567890123}">
-        <File Id="cmux-cli.exe" Source="$(var.BuildDir)\cmux-cli.exe" KeyPath="yes" Vital="yes" Checksum="yes" />
+      <!-- CLI tool (binary name mirrors upstream's `cmux` CLI surface) -->
+      <Component Id="CmuxCliApp" Guid="{D4E5F6A7-B8C9-0123-DEFA-234567890123}">
+        <File Id="CmuxCliExe" Source="$(var.BuildDir)\cmux.exe" KeyPath="yes" Vital="yes" Checksum="yes" />
       </Component>
 
-      <!-- Config template -->
-      <Component Id="cmux.json.template" Guid="{E5F6A7B8-C9D0-1234-EFAB-345678901234}">
-        <File Id="cmux.json.template" Source="$(var.SourceDir)\installer\cmux.json.template" KeyPath="yes" Vital="no" />
+      <!-- Config template (Vital=no: the app generates one if it is missing) -->
+      <Component Id="ConfigTemplate" Guid="{E5F6A7B8-C9D0-1234-EFAB-345678901234}">
+        <File Id="CmuxJsonTemplate" Source="$(var.SourceDir)\cmux.json.template" KeyPath="yes" Vital="no" />
       </Component>
 
-      <!-- License -->
-      <Component Id="LICENSE" Guid="{F6A7B8C9-D0E1-2345-FABC-456789012345}">
-        <File Id="LICENSE" Source="$(var.SourceDir)\LICENSE" KeyPath="yes" Vital="no" />
+      <!-- Third-party notices for the shipped binaries (NOT a EULA) -->
+      <Component Id="ThirdPartyNotices" Guid="{F6A7B8C9-D0E1-2345-FABC-456789012345}">
+        <File Id="NoticesTxt" Source="$(var.SourceDir)\NOTICES.txt" KeyPath="yes" Vital="no" />
       </Component>
     </ComponentGroup>
 
-    <!-- Shortcuts -->
+    <!-- Start Menu shortcuts -->
     <DirectoryRef Id="ApplicationProgramsFolder">
       <Component Id="ApplicationShortcut" Guid="{1A2B3C4D-5E6F-7890-ABCD-EF1234567891}">
         <Shortcut Id="StartMenuShortcut" Name="cmux" Description="Ghostty-based terminal with AI agent integration" Target="[INSTALLFOLDER]cmux-shell.exe" WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
-        <RegistryValue Root="HKCU" Key="Software\Manaflow\cmux" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\cmux-clone\cmux" Name="installed" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
+    <!-- Desktop shortcut -->
     <DirectoryRef Id="DesktopFolder">
       <Component Id="DesktopShortcut" Guid="{2B3C4D5E-6F78-9012-ABCD-EF1234567892}">
-        <Shortcut Id="DesktopShortcut" Name="cmux" Description="Ghostty-based terminal with AI agent integration" Target="[INSTALLFOLDER]cmux-shell.exe" WorkingDirectory="INSTALLFOLDER" />
-        <RegistryValue Root="HKCU" Key="Software\Manaflow\cmux" Name="desktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+        <Shortcut Id="DesktopShortcutLink" Name="cmux" Description="Ghostty-based terminal with AI agent integration" Target="[INSTALLFOLDER]cmux-shell.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\cmux-clone\cmux" Name="desktopShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
     <!-- Uninstall shortcut -->
     <DirectoryRef Id="ApplicationProgramsFolder">
       <Component Id="UninstallShortcut" Guid="{3C4D5E6F-7890-1234-ABCD-EF1234567893}">
-        <Shortcut Id="UninstallShortcut" Name="Uninstall cmux" Description="Uninstall cmux" Target="[SystemFolder]msiexec.exe" Arguments="/x [ProductCode]" />
-        <RegistryValue Root="HKCU" Key="Software\Manaflow\cmux" Name="uninstallShortcut" Type="integer" Value="1" KeyPath="yes" />
+        <Shortcut Id="UninstallShortcutLink" Name="Uninstall cmux" Description="Uninstall cmux" Target="[SystemFolder]msiexec.exe" Arguments="/x [ProductCode]" />
+        <RegistryValue Root="HKCU" Key="Software\cmux-clone\cmux" Name="uninstallShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
-    <!-- Environment variable for config location -->
-    <Component Id="EnvironmentVariable" Directory="INSTALLFOLDER" Guid="{4D5E6F78-9012-3456-ABCD-EF1234567894}">
-      <Environment Id="CMUX_CONFIG_FILE" Name="CMUX_CONFIG_FILE" Value="[WindowsFolder]System32\config\systemprofile\.config\cmux\cmux.json" Permanent="no" Part="all" System="yes" Action="set" />
-      <RegistryValue Root="HKCU" Key="Software\Manaflow\cmux" Name="environmentSet" Type="integer" Value="1" KeyPath="yes" />
-    </Component>
-
-    <!-- Custom Action for code signing (when available) -->
-    <CustomAction Id="SignMsi" BinaryKey="SignTool" ExeCommand="" Execute="deferred" Impersonate="no" Return="check" />
-    <Binary Id="SignTool" SourceFile="$(var.SignToolPath)" />
-
-    <!-- Install Execute Sequence -->
-    <InstallExecuteSequence>
-      <Custom Action="SignMsi" After="InstallFiles"><![CDATA[SIGNTOOL_PATH AND CERT_THUMBPRINT]]></Custom>
-    </InstallExecuteSequence>
+    <!-- Upgrade support: every installed build with a lower version is
+         removed before this one installs (major upgrade). -->
+    <Upgrade Id="$(var.UpgradeCode)">
+      <UpgradeVersion Minimum="0.0.0" Maximum="$(var.ProductVersion)" IncludeMinimum="yes" IncludeMaximum="no" Property="PREVIOUSVERSIONSINSTALLED" />
+    </Upgrade>
 
   </Product>
-
-  <!-- Upgrade support -->
-  <Upgrade Id="$(var.UpgradeCode)">
-    <UpgradeVersion Minimum="0.0.0" Maximum="$(var.ProductVersion)" IncludeMinimum="yes" IncludeMaximum="no" Property="PREVIOUSVERSIONSINSTALLED" />
-  </Upgrade>
-
 </Wix>

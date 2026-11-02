@@ -1,0 +1,1603 @@
+//! The widget: a grid of cells drawn from the emulator's screen, and window events turned
+//! back into terminal events.
+
+use std::{
+    sync::{Arc, mpsc},
+    time::Duration,
+};
+
+use egui::{
+    Align2, Color32, CornerRadius, FontId, PointerButton, Rect, Response, Sense, Stroke, TextFormat,
+    Ui, text::LayoutJob, vec2,
+};
+use libghostty_vt::{
+    Terminal as Emulator, TerminalOptions,
+    key::{self, Action},
+    mouse,
+    render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator},
+    style::RgbColor,
+    terminal::ScrollViewport,
+};
+
+use crate::{
+    ColorScheme, Error, Result, TerminalStyle, Tty, TtyStream, colors, keys, links, search,
+    selection,
+};
+
+/// Lines of scrollback a terminal keeps by default.
+pub const DEFAULT_SCROLLBACK: usize = 10_000;
+
+/// How often a terminal with a live program asks to be drawn again, so output that arrives
+/// while nothing else is happening still shows up promptly.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(33);
+/// A blinking cursor needs finer steps than the poll interval to blink evenly.
+const BLINK_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The narrowest and shortest grid a program is ever given. A widget squeezed below this
+/// reports these instead, rather than a grid with no cells in it.
+const MIN_COLS: u16 = 20;
+const MIN_ROWS: u16 = 4;
+
+/// The line editing chords a shell is sent, in place of the encoding a terminal would
+/// otherwise give them.
+///
+/// ⌃← is `ESC [ 1 ; 5 D` in every terminal, and readline binds none of it: it takes the
+/// `ESC [ 1` and types the rest, which is where a stray `;5D` in the prompt comes from. What
+/// readline does bind is `ESC b`, so that is what it is sent — and the same for the rest of
+/// the chords a line is edited with. A program that asked for the Kitty keyboard protocol
+/// reads the chord itself and gets the real thing instead; see [`Terminal::reads_the_real_chord`].
+const LEGACY_EDITING_CHORDS: &[(key::Key, key::Mods, &[u8])] = &[
+    // Word left and right, and the word behind the cursor.
+    (key::Key::ArrowLeft, key::Mods::CTRL, b"\x1bb"),
+    (key::Key::ArrowRight, key::Mods::CTRL, b"\x1bf"),
+    (key::Key::Backspace, key::Mods::CTRL, b"\x17"),
+    // The ends of the line, and the whole of it.
+    (key::Key::ArrowLeft, key::Mods::SUPER, b"\x01"),
+    (key::Key::ArrowRight, key::Mods::SUPER, b"\x05"),
+    (key::Key::Backspace, key::Mods::SUPER, b"\x15"),
+];
+
+/// What a shell is sent for one of the editing chords, if this is one of them.
+///
+/// The modifiers have to match exactly: ⌃⇧← is a selection in whatever is reading it, not a
+/// word motion someone held an extra key for.
+fn legacy_editing_chord(key: key::Key, mods: key::Mods) -> Option<&'static [u8]> {
+    LEGACY_EDITING_CHORDS
+        .iter()
+        .find(|(chord, with, _)| *chord == key && *with == mods)
+        .map(|(_, _, bytes)| *bytes)
+}
+
+/// A terminal: an emulator, the program attached to it, and the grid both end up drawn as.
+///
+/// Bytes the program writes are read from the [`TtyStream`] it was built with, on whichever
+/// thread draws the widget. The emulator is `!Send`, so the terminal lives on that thread for
+/// good — which is where a UI wants it anyway.
+///
+/// ```no_run
+/// # fn demo(ui: &mut egui::Ui, stream: egui_tty::TtyStream) -> egui_tty::Result<()> {
+/// let mut terminal = egui_tty::Terminal::new(stream)?;
+/// let style = egui_tty::TerminalStyle::from_visuals(ui.visuals());
+/// terminal.ui(ui, &style);
+/// # Ok(())
+/// # }
+/// ```
+pub struct Terminal {
+    emulator: Emulator<'static, 'static>,
+    render_state: RenderState<'static>,
+    row_iterator: RowIterator<'static>,
+    cell_iterator: CellIterator<'static>,
+    encoder: key::Encoder<'static>,
+    output: mpsc::Receiver<Vec<u8>>,
+    tty: Arc<dyn Tty>,
+    cols: u16,
+    rows: u16,
+    /// What the exit notice calls this terminal, if the host gave it a name.
+    label: Option<String>,
+    poll_interval: Duration,
+    /// Set once the program is gone, so the widget says so instead of looking merely idle.
+    exited: bool,
+    /// Set by [`Terminal::request_focus`], and cleared by the frame that acts on it.
+    pending_focus: bool,
+    /// Cursor blink phase, in seconds since the widget was first drawn.
+    blink_clock: f32,
+    /// How much of a line the wheel has asked for and not yet been given. A terminal scrolls
+    /// in whole lines and a trackpad scrolls in pixels, so this is what is left over.
+    scroll_remainder: f32,
+    /// Ghostty's pointer-to-selection state machine, driven by this widget's mouse events.
+    pointer: selection::Pointer,
+    /// The URL under the pointer, found afresh each frame it moves. Held so the row it is on
+    /// can be drawn underlined without looking it up a second time.
+    hovered_link: Option<links::Link>,
+    /// The scheme the emulator's colors were last set for. Setting them is a whole palette's
+    /// worth of work, so it happens when the scheme changes rather than every frame.
+    colored_for: Option<ColorScheme>,
+    /// The colors the emulator arrived with, read before a scheme was first applied. The dark
+    /// scheme is these, put back explicitly — asking the emulator to reset to its own
+    /// defaults does not restore them.
+    emulator_colors: Option<colors::Scheme>,
+    /// The program's mouse encoder, driven from the event pair below while the program
+    /// answers its own mouse (the widget's selection machine and the wheel's viewport
+    /// scroll stand aside for the duration).
+    mouse_encoder: mouse::Encoder<'static>,
+    /// One event reused for every mouse report: the encoder re-reads the tracking state
+    /// from the emulator each time, so a rebuild per report buys nothing.
+    mouse_event: mouse::Event<'static>,
+    /// The surface position of the last pointer frame, so motion reports are sent only
+    /// when the pointer moved.
+    last_mouse_pos: Option<egui::Pos2>,
+    /// The buttons whose presses were reported to the program and never released: a
+    /// release is only a report when this pointer's press was.
+    reported_mouse_buttons: u8,
+    /// Whether mouse tracking was on the previous frame, so a mode switch is spotted
+    /// and its in-flight gestures are dropped.
+    mouse_tracking_last: Option<bool>,
+}
+
+impl Terminal {
+    /// A terminal attached to a program, with [`DEFAULT_SCROLLBACK`] lines of scrollback.
+    pub fn new(stream: TtyStream) -> Result<Self> {
+        Self::with_scrollback(stream, DEFAULT_SCROLLBACK)
+    }
+
+    /// The same, keeping however many lines of scrollback you ask for.
+    pub fn with_scrollback(stream: TtyStream, max_scrollback: usize) -> Result<Self> {
+        let TtyStream { output, tty } = stream;
+        let cols = 80;
+        let rows = 24;
+        let mut emulator = Emulator::new(TerminalOptions {
+            cols,
+            rows,
+            max_scrollback,
+        })
+        .map_err(|error| Error::context("failed to create a terminal", error))?;
+
+        // Programs probe the terminal on startup and wait for the answers, so the replies
+        // have to go back to the program or the widget would look hung.
+        let reply_to = Arc::clone(&tty);
+        emulator
+            .on_pty_write(move |_emulator, data| {
+                let _ = reply_to.reply(data);
+            })
+            .map_err(|error| Error::context("failed to install the terminal reply hook", error))?;
+        let mut mouse_encoder = mouse::Encoder::new()
+            .map_err(|error| Error::context("failed to create a mouse encoder", error))?;
+        // Motion is deduplicated by the last cell the program was told about: a TUI does
+        // not want the same cell twice because the pointer wiggled inside one cell.
+        mouse_encoder.set_track_last_cell(true);
+
+        Ok(Self {
+            emulator,
+            render_state: RenderState::new()
+                .map_err(|error| Error::context("failed to create a render state", error))?,
+            row_iterator: RowIterator::new()
+                .map_err(|error| Error::context("failed to create a row iterator", error))?,
+            cell_iterator: CellIterator::new()
+                .map_err(|error| Error::context("failed to create a cell iterator", error))?,
+            encoder: key::Encoder::new()
+                .map_err(|error| Error::context("failed to create a key encoder", error))?,
+            output,
+            tty,
+            cols,
+            rows,
+            label: None,
+            poll_interval: DEFAULT_POLL_INTERVAL,
+            exited: false,
+            pending_focus: false,
+            blink_clock: 0.0,
+            scroll_remainder: 0.0,
+            pointer: selection::Pointer::new()?,
+            hovered_link: None,
+            colored_for: None,
+            emulator_colors: None,
+            mouse_encoder,
+            mouse_event: mouse::Event::new()
+                .map_err(|error| Error::context("failed to create a mouse event", error))?,
+            last_mouse_pos: None,
+            reported_mouse_buttons: 0,
+            mouse_tracking_last: None,
+        })
+    }
+
+    /// Name this terminal, which is what its "exited" notice ends up saying.
+    #[must_use]
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// How often a terminal with a live program asks to be drawn again. The default is 33ms,
+    /// which is fast enough to feel immediate and slow enough to leave the CPU alone.
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    /// Take the keyboard on the next frame, the way a click into the grid would.
+    pub fn request_focus(&mut self) {
+        self.pending_focus = true;
+    }
+
+    /// Whether the program behind this terminal has ended.
+    pub fn has_exited(&self) -> bool {
+        self.exited
+    }
+
+    /// The size of the grid the program is talking to, in cells.
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
+    /// The title the running program set, for a tab strip or a window title.
+    pub fn title(&self) -> Option<String> {
+        self.emulator
+            .title()
+            .ok()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    /// Send bytes to the program as if they had been typed.
+    pub fn send(&self, bytes: &[u8]) -> Result<()> {
+        self.tty.write(bytes)
+    }
+
+    /// What a copy would put on the clipboard right now.
+    pub fn selected_text(&self) -> Option<String> {
+        selection::selected_text(&self.emulator)
+    }
+
+    /// Search the screen and the scrollback, show the `at`th match, and say how many there
+    /// were.
+    ///
+    /// Call this when a query or the current match changes rather than every frame: it reads
+    /// the whole scrollback back as text.
+    pub fn find(&mut self, query: &str, at: usize) -> usize {
+        let found = search::find_all(&self.emulator, query);
+        match found.get(at) {
+            Some(found) => report(search::show(&mut self.emulator, *found, self.rows)),
+            // Nothing to show, and nothing left highlighted from the last query either.
+            None => report(
+                self.emulator
+                    .set_selection(None)
+                    .map(|_| ())
+                    .map_err(|error| Error::context("failed to clear the selection", error)),
+            ),
+        }
+        found.len()
+    }
+
+    /// Everything on screen, one line per row and trailing blanks trimmed.
+    ///
+    /// This reads the emulator's own grid, which is what the widget paints from, so it is how
+    /// a test checks that a program's output made it through the VT parser.
+    pub fn visible_text(&mut self) -> Result<String> {
+        let Self {
+            emulator,
+            render_state,
+            row_iterator,
+            cell_iterator,
+            ..
+        } = self;
+
+        let snapshot = render_state
+            .update(emulator)
+            .map_err(|error| Error::context("failed to read the screen", error))?;
+        let mut rows = row_iterator
+            .update(&snapshot)
+            .map_err(|error| Error::context("failed to walk the rows", error))?;
+
+        let mut out = String::new();
+        let mut cell_text = String::new();
+        while let Some(row) = rows.next() {
+            let mut cells = cell_iterator
+                .update(row)
+                .map_err(|error| Error::context("failed to walk the cells", error))?;
+            let mut line = String::new();
+            while let Some(view) = cells.next() {
+                cell_text.clear();
+                if view.graphemes_len().unwrap_or(0) > 0 {
+                    let _ = view.graphemes_utf8(&mut cell_text);
+                }
+                line.push_str(if cell_text.is_empty() { " " } else { &cell_text });
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+
+        Ok(out)
+    }
+
+    /// The default foreground and background the grid would be painted with right now.
+    pub fn drawn_colors(&mut self) -> Result<(Color32, Color32)> {
+        let Self {
+            emulator,
+            render_state,
+            ..
+        } = self;
+        let snapshot = render_state
+            .update(emulator)
+            .map_err(|error| Error::context("failed to read the screen", error))?;
+        let colors = snapshot
+            .colors()
+            .map_err(|error| Error::context("failed to read the colors", error))?;
+        Ok((color_of(colors.foreground), color_of(colors.background)))
+    }
+
+    /// Put a scheme's colors on the emulator. Drawing does this for you; call it directly to
+    /// set the colors of a terminal that is not on screen yet.
+    pub fn set_color_scheme(&mut self, scheme: ColorScheme) {
+        if self.colored_for == Some(scheme) {
+            return;
+        }
+        // The first call is also when the emulator's own colors are worth reading: nothing
+        // has overwritten them yet, and the dark scheme is made of them.
+        if self.emulator_colors.is_none() {
+            let Self {
+                emulator,
+                render_state,
+                ..
+            } = self;
+            match render_state
+                .update(emulator)
+                .and_then(|snapshot| snapshot.colors())
+            {
+                Ok(colors) => self.emulator_colors = Some(colors::emulator_scheme(&colors)),
+                Err(error) => {
+                    report(Err(Error::context(
+                        "failed to read the terminal's own colors",
+                        error,
+                    )));
+                    return;
+                }
+            }
+        }
+
+        let Some(emulator) = self.emulator_colors.clone() else {
+            return;
+        };
+        report(colors::apply(&mut self.emulator, &emulator, scheme));
+        self.colored_for = Some(scheme);
+    }
+
+    /// Feed everything the program has written since the last call into the emulator, without
+    /// drawing. Returns whether anything arrived.
+    ///
+    /// Drawing does this first, so a UI never has to; a test that waits on output does.
+    pub fn poll(&mut self) -> bool {
+        let mut received = false;
+        loop {
+            match self.output.try_recv() {
+                Ok(chunk) => {
+                    self.emulator.vt_write(&chunk);
+                    received = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.exited = true;
+                    break;
+                }
+            }
+        }
+        // A local program's output channel can stay open after the program is gone, when what
+        // holds the session alive is this terminal, so the handle is asked directly.
+        if self.tty.has_exited() {
+            self.exited = true;
+        }
+        received
+    }
+
+    /// Draw the terminal into all the space the `ui` has left, and handle its input.
+    ///
+    /// While the program is alive the widget asks for the next frame itself, so output that
+    /// arrives with nothing else going on still appears — see
+    /// [`with_poll_interval`](Terminal::with_poll_interval).
+    pub fn ui(&mut self, ui: &mut Ui, style: &TerminalStyle) -> Response {
+        self.poll();
+        self.set_color_scheme(style.scheme);
+
+        let padding = style.padding;
+        let cell = cell_size(ui.painter(), &style.font);
+        let available = ui.available_size();
+        let cols = ((available.x - 2.0 * padding) / cell.x)
+            .floor()
+            .max(f32::from(MIN_COLS)) as u16;
+        let rows = ((available.y - 2.0 * padding) / cell.y)
+            .floor()
+            .max(f32::from(MIN_ROWS)) as u16;
+        report(self.resize(cols, rows, cell));
+
+        let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
+        // A drag as well as a click: selecting text is a drag, and a pointer that never
+        // clicked would leave the terminal without the keyboard — so the copy that a selection
+        // is made for would go to whatever had it instead.
+        if response.clicked()
+            || response.drag_started()
+            || std::mem::take(&mut self.pending_focus)
+        {
+            response.request_focus();
+        }
+        let focused = response.has_focus();
+
+        if focused {
+            // Tab, the arrows and Escape belong to the program, not to egui's focus
+            // traversal: without this, Tab moves the keyboard to the next widget instead of
+            // completing a path.
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                )
+            });
+            self.handle_input(ui);
+            // Only the terminal with the keyboard: a copy chord meant for one must not be
+            // answered by every other terminal open beside it.
+            self.handle_clipboard(ui);
+        }
+        // When the program's mouse tracking turns on or off, what is left of a wheel
+        // gesture and a pointer capture belongs to the wrong half: drop them rather
+        // than spend them on whichever mode's got a different meaning.
+        let tracking = self.emulator.is_mouse_tracking().unwrap_or(false);
+        if self.mouse_tracking_last != Some(tracking) {
+            self.mouse_tracking_last = Some(tracking);
+            self.scroll_remainder = 0.0;
+            self.last_mouse_pos = None;
+            self.reported_mouse_buttons = 0;
+        }
+        self.handle_scroll(ui, &response, cell, padding);
+
+        let origin = response.rect.min + vec2(padding, padding);
+        self.handle_pointer(ui, &response, origin, cell);
+
+        self.blink_clock += ui.input(|input| input.stable_dt).min(0.1);
+        let cursor_blinking = match self.draw(&painter, origin, cell, style, focused) {
+            Ok(blinking) => blinking,
+            Err(error) => {
+                painter.text(
+                    origin,
+                    Align2::LEFT_TOP,
+                    format!("terminal render failed: {error}"),
+                    style.font.clone(),
+                    style.error_ink,
+                );
+                false
+            }
+        };
+
+        if self.exited {
+            let what = self.label.as_deref().unwrap_or("the program");
+            painter.text(
+                response.rect.left_bottom() + vec2(padding, -padding - cell.y),
+                Align2::LEFT_TOP,
+                format!("[{what} exited]"),
+                FontId::monospace(cell.y * 0.7),
+                style.notice_ink,
+            );
+        } else {
+            let interval = if cursor_blinking {
+                self.poll_interval.min(BLINK_POLL_INTERVAL)
+            } else {
+                self.poll_interval
+            };
+            ui.ctx().request_repaint_after(interval);
+        }
+
+        response
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16, cell: egui::Vec2) -> Result<()> {
+        if cols == self.cols && rows == self.rows {
+            return Ok(());
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.emulator
+            .resize(cols, rows, cell.x as u32, cell.y as u32)
+            .map_err(|error| Error::context("failed to resize the terminal", error))?;
+        // The program needs to hear about it too, so its foreground process gets SIGWINCH.
+        self.tty.resize(cols, rows)
+    }
+
+    /// Turn the pointer into what the program makes of it: reports while the program has
+    /// mouse tracking on, a selection and a click on a link when it does not.
+    ///
+    /// The widget owns the presses it asks the program about — a release is only
+    /// reported for a press this same pointer started, so a click that began over the
+    /// window's chrome or another pane never lands on a TUI mid-session.
+    fn handle_pointer(
+        &mut self,
+        ui: &Ui,
+        response: &Response,
+        origin: egui::Pos2,
+        cell_size: egui::Vec2,
+    ) {
+        let (pointer_at, modifiers, buttons, now) = ui.input(|input| {
+            (
+                input.pointer.interact_pos(),
+                input.modifiers,
+                [
+                    PointerButton::Primary,
+                    PointerButton::Secondary,
+                    PointerButton::Middle,
+                ]
+                .map(|button| {
+                    (
+                        input.pointer.button_pressed(button),
+                        input.pointer.button_released(button),
+                        input.pointer.button_down(button),
+                    )
+                }),
+                Duration::from_secs_f64(input.time.max(0.0)),
+            )
+        });
+
+        // While the program answers its own mouse, the pointer belongs to it: no
+        // selection is made, and a click opens no link — the program decides what a
+        // click means. A terminal that did both would present two answers for one
+        // gesture.
+        if self.emulator.is_mouse_tracking().unwrap_or(false) {
+            self.hovered_link = None;
+            if let Some(at) = pointer_at {
+                if response.contains_pointer() || self.reported_mouse_buttons != 0 {
+                    self.report_pointer(
+                        response,
+                        (
+                            at.x - response.rect.min.x,
+                            at.y - response.rect.min.y,
+                        ),
+                        cell_size,
+                        origin.x - response.rect.min.x,
+                        modifiers,
+                        &buttons,
+                    );
+                }
+            }
+            return;
+        }
+
+        // A pointer past the edge of the grid still belongs to the row and column nearest it,
+        // which is what makes a drag off the bottom select to the end of the line.
+        let cell = pointer_at.map(|at| selection::Cell {
+            x: (((at.x - origin.x) / cell_size.x).floor().max(0.0) as u16).min(self.cols - 1),
+            y: (((at.y - origin.y) / cell_size.y).floor().max(0.0) as u16).min(self.rows - 1),
+        });
+
+        self.hovered_link = match (response.contains_pointer(), cell) {
+            // A link is only worth looking for when nothing is being dragged over it.
+            (true, Some(cell)) if !self.pointer.dragging => {
+                links::link_at(&self.emulator, self.cols, cell.x, cell.y)
+            }
+            _ => None,
+        };
+        if self.hovered_link.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        let Some((cell, at)) = cell.zip(pointer_at) else {
+            return;
+        };
+        let at = (at.x - response.rect.min.x, at.y - response.rect.min.y);
+
+        let pressed = buttons[0].0;
+        let released = buttons[0].1;
+        if pressed && response.contains_pointer() {
+            report(self.pointer.press(&self.emulator, cell, at, now));
+        } else if self.pointer.dragging && released {
+            // A click that never moved is not a selection: it is how a link is opened.
+            let was_a_click = !self.pointer.dragged(&self.emulator);
+            report(self.pointer.release(&self.emulator));
+            if was_a_click
+                && let Some(link) = &self.hovered_link
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&link.url));
+            }
+        } else if self.pointer.dragging {
+            let geometry = selection::geometry(
+                self.cols,
+                cell_size.x,
+                origin.x - response.rect.min.x,
+                response.rect.height().max(1.0),
+            );
+            // Alt turns a drag into a block selection, which is how a column of output is
+            // taken out of a table without its neighbours.
+            let rectangle = ui.input(|input| input.modifiers.alt);
+            report(
+                self.pointer
+                    .drag(&self.emulator, cell, at, geometry, rectangle),
+            );
+        }
+    }
+
+    /// Report everything this frame's pointer did as the program's mouse: each captured
+    /// button's press and release, then one motion when the pointer moved. The encoder
+    /// drops what the program's tracking mode does not ask for — motion while the program
+    /// is in press/release mode, or the same cell twice.
+    fn report_pointer(
+        &mut self,
+        response: &Response,
+        at: (f32, f32),
+        cell_size: egui::Vec2,
+        padding: f32,
+        modifiers: egui::Modifiers,
+        buttons: &[(bool, bool, bool); 3],
+    ) {
+        let mods = keys::vt_mods(modifiers);
+        let held = held_button(self.reported_mouse_buttons, buttons);
+
+        for (index, &(pressed, released, _down)) in buttons.iter().enumerate() {
+            if pressed && response.contains_pointer() {
+                self.reported_mouse_buttons |= 1 << index;
+                self.encode_mouse_report(
+                    mouse::Action::Press,
+                    Some(mouse_report_button(index)),
+                    at,
+                    cell_size,
+                    padding,
+                    mods,
+                    true,
+                );
+            }
+            if released && self.reported_mouse_buttons >> index & 1 == 1 {
+                self.reported_mouse_buttons &= !(1 << index);
+                self.encode_mouse_report(
+                    mouse::Action::Release,
+                    Some(mouse_report_button(index)),
+                    at,
+                    cell_size,
+                    padding,
+                    mods,
+                    self.reported_mouse_buttons != 0,
+                );
+            }
+        }
+
+        if Some(at) != self.last_mouse_pos.map(|pos| (pos.x, pos.y)) {
+            self.last_mouse_pos = Some(egui::Pos2 { x: at.0, y: at.1 });
+            self.encode_mouse_report(
+                mouse::Action::Motion,
+                held,
+                at,
+                cell_size,
+                padding,
+                mods,
+                self.reported_mouse_buttons != 0,
+            );
+        }
+    }
+
+    /// One mouse report, in whatever format the program asked for. A report with
+    /// nothing in it is handed nowhere: the tracking mode decides, and a mode that
+    /// wants nothing — say press/release mode given a motion — is not the program's
+    /// news.
+    fn encode_mouse_report(
+        &mut self,
+        action: mouse::Action,
+        button: Option<mouse::Button>,
+        at: (f32, f32),
+        cell_size: egui::Vec2,
+        padding: f32,
+        mods: key::Mods,
+        any_button_down: bool,
+    ) {
+        self.mouse_event.set_action(action);
+        self.mouse_event.set_button(button);
+        self.mouse_event.set_mods(mods);
+        self.mouse_event
+            .set_position(mouse::Position { x: at.0, y: at.1 });
+
+        // The sizing the encoder converts against is the widget's own: the grid plus
+        // the padding around it, in the pixels-per-cell the program was resized by.
+        self.mouse_encoder
+            .set_options_from_terminal(&self.emulator);
+        self.mouse_encoder.set_size(mouse::EncoderSize {
+            screen_width: (padding * 2.0 + f32::from(self.cols) * cell_size.x).max(1.0)
+                as u32,
+            screen_height: (padding * 2.0 + f32::from(self.rows) * cell_size.y).max(1.0)
+                as u32,
+            cell_width: cell_size.x.max(1.0) as u32,
+            cell_height: cell_size.y.max(1.0) as u32,
+            padding_top: padding.max(0.0) as u32,
+            padding_bottom: padding.max(0.0) as u32,
+            padding_right: padding.max(0.0) as u32,
+            padding_left: padding.max(0.0) as u32,
+        });
+        self.mouse_encoder.set_any_button_pressed(any_button_down);
+
+        let mut encoded = Vec::new();
+        match self
+            .mouse_encoder
+            .encode_to_vec(&mut self.mouse_event, &mut encoded)
+        {
+            Ok(()) => {
+                if !encoded.is_empty() {
+                    report(self.tty.write(&encoded));
+                }
+            }
+            Err(error) => {
+                report(Err(Error::context(
+                    "failed to encode a mouse report",
+                    error,
+                )));
+            }
+        }
+    }
+
+    /// Copy takes whatever is selected, and paste goes to the program.
+    ///
+    /// The platform turns those chords into events of their own before egui ever sees a key,
+    /// which is why they are handled here rather than as keystrokes.
+    fn handle_clipboard(&mut self, ui: &Ui) {
+        let events = ui.input(|input| input.events.clone());
+        for event in &events {
+            match event {
+                egui::Event::Copy | egui::Event::Cut => {
+                    match selection::selected_text(&self.emulator) {
+                        Some(text) if !text.is_empty() => ui.ctx().copy_text(text),
+                        // Nothing is selected, so on the platforms where the copy chord is
+                        // also the interrupt the program is the one that wanted it. The key
+                        // event itself never arrives, so the byte is sent here instead.
+                        _ if COPY_CHORD_IS_ALSO_INTERRUPT => {
+                            report(self.tty.write(&[0x03]));
+                        }
+                        _ => {}
+                    }
+                }
+                egui::Event::Paste(text) => match selection::encode_paste(&self.emulator, text) {
+                    Ok(bytes) => report(self.tty.write(&bytes)),
+                    Err(error) => report(Err(error)),
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_scroll(&mut self, ui: &Ui, response: &Response, cell_size: egui::Vec2, padding: f32) {
+        if !response.hovered() {
+            return;
+        }
+        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+        if scroll == 0.0 || cell_size.y <= 0.0 {
+            return;
+        }
+
+        // A terminal scrolls in whole lines, and a trackpad scrolls in pixels — most of its
+        // frames worth a fraction of one. Rounding each frame on its own threw those away, so
+        // a gesture made of them moved nothing at all however far it went; what is left over
+        // is kept instead, and the next frame adds to it until it is worth a line.
+        self.scroll_remainder += scroll / cell_size.y;
+        let lines = self.scroll_remainder.trunc();
+        self.scroll_remainder -= lines;
+        if lines == 0.0 {
+            return;
+        }
+
+        // While the program answers its own mouse, the wheel belongs to it: one press and
+        // release of button four (up) or five (down) per line, at the cell the pointer is
+        // over. TUIs wheel their own scrollback this way; scrolling the widget's viewport
+        // here as well would move two scroll positions at once.
+        if self.emulator.is_mouse_tracking().unwrap_or(false) {
+            let at = ui
+                .input(|input| input.pointer.latest_pos())
+                .map(|pos| (pos.x - response.rect.min.x, pos.y - response.rect.min.y))
+                .unwrap_or((response.rect.width() / 2.0, response.rect.height() / 2.0));
+            let modifiers = ui.input(|input| input.modifiers);
+            let mods = keys::vt_mods(modifiers);
+            let button = if lines > 0.0 {
+                mouse::Button::Four
+            } else {
+                mouse::Button::Five
+            };
+            for _ in 0..(lines.abs() as u32) {
+                self.encode_mouse_report(
+                    mouse::Action::Press,
+                    Some(button),
+                    at,
+                    cell_size,
+                    padding,
+                    mods,
+                    true,
+                );
+                self.encode_mouse_report(
+                    mouse::Action::Release,
+                    Some(button),
+                    at,
+                    cell_size,
+                    padding,
+                    mods,
+                    false,
+                );
+            }
+            return;
+        }
+
+        // Up on a wheel means back into the scrollback.
+        self.emulator
+            .scroll_viewport(ScrollViewport::Delta(-(lines as isize)));
+    }
+
+    /// Encode this frame's key and text events and send them to the program.
+    ///
+    /// libghostty decides what the bytes are — application cursor keys, the Kitty keyboard
+    /// protocol, `modifyOtherKeys` — so all that happens here is pairing each physical key
+    /// press with the text the platform produced for it.
+    fn handle_input(&mut self, ui: &Ui) {
+        let events = ui.input(|input| input.events.clone());
+        let mut pending_text: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut text_index = 0usize;
+
+        self.encoder.set_options_from_terminal(&self.emulator);
+        let mut encoded = Vec::new();
+
+        for event in &events {
+            let egui::Event::Key {
+                key,
+                pressed,
+                repeat,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let Some(vt) = keys::vt_key(*key) else {
+                continue;
+            };
+            if keys::is_modifier_key(vt) {
+                continue;
+            }
+            // Ghostty encodes releases only when the program asked for them, and egui does
+            // not tell us that, so presses and repeats are what get sent.
+            if !pressed {
+                continue;
+            }
+
+            let mods = keys::vt_mods(*modifiers);
+            if !self.reads_the_real_chord()
+                && let Some(bytes) = legacy_editing_chord(vt, mods)
+            {
+                encoded.extend_from_slice(bytes);
+                continue;
+            }
+            // A control or command combo is a command, not text: the platform's character
+            // for it (or lack of one) must not override libghostty's encoding.
+            let text = if mods.intersects(key::Mods::CTRL | key::Mods::SUPER) {
+                None
+            } else {
+                let text = pending_text.get(text_index).cloned();
+                if text.is_some() {
+                    text_index += 1;
+                }
+                text
+            };
+
+            report(self.encode_key(vt, mods, text, *repeat, &mut encoded));
+        }
+
+        // Anything left is text with no key event behind it: an IME commit, or a paste.
+        for text in pending_text.drain(text_index.min(pending_text.len())..) {
+            encoded.extend_from_slice(text.as_bytes());
+        }
+
+        if !encoded.is_empty() {
+            report(self.tty.write(&encoded));
+        }
+    }
+
+    /// Whether the running program asked for the Kitty keyboard protocol, and so reads the
+    /// chord itself rather than an escape someone once chose to stand for it.
+    fn reads_the_real_chord(&self) -> bool {
+        self.emulator
+            .kitty_keyboard_flags()
+            .is_ok_and(|flags| !flags.is_empty())
+    }
+
+    fn encode_key(
+        &mut self,
+        vt: key::Key,
+        mods: key::Mods,
+        text: Option<String>,
+        repeat: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let mut event = key::Event::new()
+            .map_err(|error| Error::context("failed to create a key event", error))?;
+        event.set_action(if repeat { Action::Repeat } else { Action::Press });
+        event.set_key(vt);
+        event.set_mods(mods);
+        let unshifted = keys::unshifted_codepoint(vt);
+        if let Some(codepoint) = unshifted {
+            event.set_unshifted_codepoint(codepoint);
+        }
+        // Shift that went into making the character is not a modifier the program should be
+        // told about — it is already in the text. Saying so is what the Kitty keyboard
+        // protocol needs to send `?` rather than the `/` key with shift held.
+        if keys::shift_was_consumed(mods, unshifted, text.as_deref()) {
+            event.set_consumed_mods(key::Mods::SHIFT);
+        }
+        if let Some(text) = text {
+            event.set_utf8(Some(text));
+        }
+
+        self.encoder
+            .encode_to_vec(&event, out)
+            .map_err(|error| Error::context("failed to encode a keystroke", error))
+    }
+
+    /// Paint one frame of the grid. Returns whether a blinking cursor wants a repaint.
+    fn draw(
+        &mut self,
+        painter: &egui::Painter,
+        origin: egui::Pos2,
+        cell: egui::Vec2,
+        style: &TerminalStyle,
+        focused: bool,
+    ) -> Result<bool> {
+        let Self {
+            emulator,
+            render_state,
+            row_iterator,
+            cell_iterator,
+            blink_clock,
+            hovered_link,
+            ..
+        } = self;
+        // Read before the fields below are borrowed, so the cursor's phase does not depend
+        // on how the emulator's own borrows are arranged.
+        let blink_clock = *blink_clock;
+        let hovered_link = hovered_link.clone();
+
+        let snapshot = render_state
+            .update(emulator)
+            .map_err(|error| Error::context("failed to read the screen", error))?;
+        let colors = snapshot
+            .colors()
+            .map_err(|error| Error::context("failed to read the colors", error))?;
+        let default_fg = color_of(colors.foreground);
+        let default_bg = color_of(colors.background);
+
+        let mut rows = row_iterator
+            .update(&snapshot)
+            .map_err(|error| Error::context("failed to walk the rows", error))?;
+
+        let mut y = origin.y;
+        let mut text = String::with_capacity(16);
+        let mut row_index: u16 = 0;
+
+        while let Some(row) = rows.next() {
+            // The link, if any, is on one row: the cells of every other row skip the check.
+            let underlined = hovered_link
+                .as_ref()
+                .filter(|link| link.row == row_index)
+                .map(|link| link.columns.clone());
+            let mut column_index: u16 = 0;
+
+            let mut cells = cell_iterator
+                .update(row)
+                .map_err(|error| Error::context("failed to walk the cells", error))?;
+            let mut x = origin.x;
+            // One layout job per row: neighbouring cells that share a style become one run,
+            // so a full screen costs a handful of galleys rather than a couple of thousand.
+            let mut job = LayoutJob::default();
+            let mut run: Option<Run> = None;
+
+            while let Some(view) = cells.next() {
+                let selected = view.is_selected().unwrap_or(false);
+                let grapheme_count = view.graphemes_len().unwrap_or(0);
+                let cell_bg = view.bg_color().ok().flatten().map(color_of);
+
+                let mut fg = view
+                    .fg_color()
+                    .ok()
+                    .flatten()
+                    .map(color_of)
+                    .unwrap_or(default_fg);
+                let mut bg = cell_bg;
+                let mut bold = false;
+                let mut italic = false;
+                let mut underline = false;
+                let mut strikethrough = false;
+
+                if view.has_styling().unwrap_or(false)
+                    && let Ok(cell_style) = view.style()
+                {
+                    if cell_style.inverse {
+                        let swapped = bg.unwrap_or(default_bg);
+                        bg = Some(fg);
+                        fg = swapped;
+                    }
+                    bold = cell_style.bold;
+                    italic = cell_style.italic;
+                    underline = cell_style.underline != libghostty_vt::style::Underline::None;
+                    strikethrough = cell_style.strikethrough;
+                }
+                if selected {
+                    let swapped = bg.unwrap_or(default_bg);
+                    bg = Some(fg);
+                    fg = swapped;
+                }
+                // The link the pointer is on is underlined, which is what says it can be
+                // clicked at all.
+                if underlined
+                    .as_ref()
+                    .is_some_and(|columns| columns.contains(&column_index))
+                {
+                    underline = true;
+                }
+
+                if let Some(bg) = bg {
+                    painter.rect_filled(
+                        Rect::from_min_size(egui::pos2(x, y), cell),
+                        CornerRadius::ZERO,
+                        bg,
+                    );
+                }
+
+                text.clear();
+                if grapheme_count > 0 {
+                    let _ = view.graphemes_utf8(&mut text);
+                }
+                // A blank cell still has to occupy its column in the row's layout.
+                let glyph = if text.is_empty() { " " } else { text.as_str() };
+
+                let cell_style = CellStyle {
+                    fg,
+                    bold,
+                    italic,
+                    underline,
+                    strikethrough,
+                };
+                match &mut run {
+                    Some(current) if current.style == cell_style => current.text.push_str(glyph),
+                    Some(current) => {
+                        current.flush(&mut job, style);
+                        *current = Run::new(cell_style, glyph);
+                    }
+                    None => run = Some(Run::new(cell_style, glyph)),
+                }
+
+                x += cell.x;
+                column_index += 1;
+            }
+
+            if let Some(mut current) = run.take() {
+                current.flush(&mut job, style);
+            }
+            if !job.sections.is_empty() {
+                let galley = painter.layout_job(job);
+                painter.galley(egui::pos2(origin.x, y), galley, default_fg);
+            }
+
+            let _ = row.set_dirty(false);
+            y += cell.y;
+            row_index += 1;
+        }
+
+        let mut blinking = false;
+        if snapshot.cursor_visible().unwrap_or(false)
+            && let Ok(Some(viewport)) = snapshot.cursor_viewport()
+        {
+            blinking = snapshot.cursor_blinking().unwrap_or(false);
+            let visible = !blinking || blink_clock.rem_euclid(1.06) < 0.53;
+
+            if visible {
+                let color = colors.cursor.map(color_of).unwrap_or(style.cursor);
+                let at = egui::pos2(
+                    origin.x + f32::from(viewport.x) * cell.x,
+                    origin.y + f32::from(viewport.y) * cell.y,
+                );
+                draw_cursor(
+                    painter,
+                    Rect::from_min_size(at, cell),
+                    snapshot
+                        .cursor_visual_style()
+                        .unwrap_or(CursorVisualStyle::Block),
+                    color,
+                    focused,
+                );
+            }
+        }
+
+        let _ = snapshot.set_dirty(Dirty::Clean);
+        Ok(blinking)
+    }
+}
+
+/// A window that is not focused shows a hollow cursor, the way terminals normally do.
+fn draw_cursor(
+    painter: &egui::Painter,
+    rect: Rect,
+    style: CursorVisualStyle,
+    color: Color32,
+    focused: bool,
+) {
+    // An unfocused terminal, and a program that asked for a hollow cursor, both draw an
+    // outline.
+    if !focused || style == CursorVisualStyle::BlockHollow {
+        painter.rect_stroke(
+            rect.shrink(0.5),
+            CornerRadius::ZERO,
+            Stroke::new(1.0, color),
+            egui::StrokeKind::Inside,
+        );
+        return;
+    }
+
+    let filled = match style {
+        CursorVisualStyle::Bar => Rect::from_min_size(rect.min, vec2(2.0, rect.height())),
+        CursorVisualStyle::Underline => Rect::from_min_size(
+            egui::pos2(rect.min.x, rect.max.y - 2.0),
+            vec2(rect.width(), 2.0),
+        ),
+        _ => rect,
+    };
+    painter.rect_filled(filled, CornerRadius::ZERO, color);
+}
+
+/// On macOS the copy chord is ⌘C, which no program would ever have been sent. Everywhere else
+/// it is Ctrl+C — the chord that interrupts a program — so with nothing selected it has to
+/// reach the program instead of being swallowed.
+const COPY_CHORD_IS_ALSO_INTERRUPT: bool = !cfg!(target_os = "macos");
+
+/// A terminal keeps running whatever the emulator says: a failed selection is not worth
+/// tearing a shell down over, but it is worth saying out loud.
+fn report(result: Result<()>) {
+    if let Err(error) = result {
+        eprintln!("[egui_tty] {error}");
+    }
+}
+
+/// The terminal name of the `index`th button of the widget's pointer, in the order
+/// [`PointerButton::Primary`], [`PointerButton::Secondary`], [`PointerButton::Middle`]
+/// are laid out in [`Terminal::handle_pointer`].
+fn mouse_report_button(index: usize) -> mouse::Button {
+    match index {
+        0 => mouse::Button::Left,
+        1 => mouse::Button::Right,
+        _ => mouse::Button::Middle,
+    }
+}
+
+/// The first button of the pointer that is down, whether or not its report has been
+/// sent yet: the reported motion needs the button it is being moved under, and none
+/// when the pointer is over the program while no button is held.
+fn held_button(reported: u8, buttons: &[(bool, bool, bool); 3]) -> Option<mouse::Button> {
+    for (index, bits) in buttons.iter().enumerate() {
+        if bits.2 || (reported >> index & 1 != 0) {
+            return Some(mouse_report_button(index));
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct CellStyle {
+    fg: Color32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+}
+
+/// A run of neighbouring cells that share a style, accumulated so the row can be laid out
+/// in as few sections as possible.
+struct Run {
+    style: CellStyle,
+    text: String,
+}
+
+impl Run {
+    fn new(style: CellStyle, glyph: &str) -> Self {
+        Self {
+            style,
+            text: glyph.to_string(),
+        }
+    }
+
+    fn flush(&mut self, job: &mut LayoutJob, style: &TerminalStyle) {
+        if self.text.is_empty() {
+            return;
+        }
+        let mut format = TextFormat {
+            font_id: style.font.clone(),
+            color: self.style.fg,
+            italics: self.style.italic,
+            ..Default::default()
+        };
+        if self.style.underline {
+            format.underline = Stroke::new(1.0, self.style.fg);
+        }
+        if self.style.strikethrough {
+            format.strikethrough = Stroke::new(1.0, self.style.fg);
+        }
+        // egui's bundled monospace font has no bold face, so bold is rendered as a brighter
+        // ink against the same background rather than a heavier stroke.
+        if self.style.bold {
+            format.color = mix(self.style.fg, style.bold_ink);
+        }
+        job.append(&self.text, 0.0, format);
+        self.text.clear();
+    }
+}
+
+fn mix(color: Color32, toward: Color32) -> Color32 {
+    let mix = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
+    Color32::from_rgb(
+        mix(color.r(), toward.r()),
+        mix(color.g(), toward.g()),
+        mix(color.b(), toward.b()),
+    )
+}
+
+fn color_of(rgb: RgbColor) -> Color32 {
+    Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+}
+
+/// The advance and line height of a monospace font, which is what a terminal cell is.
+///
+/// Measured from a laid-out glyph, so the background rects the grid draws line up with the
+/// text egui puts inside them.
+pub fn cell_size(painter: &egui::Painter, font: &FontId) -> egui::Vec2 {
+    let galley = painter.layout_no_wrap("M".to_string(), font.clone(), Color32::WHITE);
+    vec2(galley.size().x.max(1.0), galley.size().y.max(1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, mpsc};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<u8>>);
+
+    impl Tty for Recorder {
+        fn write(&self, bytes: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What one keystroke sends to the program: the physical key, the modifiers, and the text
+    /// the platform produced for it, which is exactly what `handle_input` pairs up.
+    fn encoded(key: key::Key, mods: key::Mods, text: Option<&str>) -> Vec<u8> {
+        encoded_with(key, mods, text, b"")
+    }
+
+    /// The same, after the program has asked for something — the Kitty keyboard protocol,
+    /// say, which is a different encoding entirely.
+    fn encoded_with(
+        key: key::Key,
+        mods: key::Mods,
+        text: Option<&str>,
+        asked_for: &[u8],
+    ) -> Vec<u8> {
+        let (writer, output) = mpsc::channel();
+        let mut terminal = Terminal::new(TtyStream {
+            output,
+            tty: Arc::new(Recorder::default()) as Arc<dyn Tty>,
+        })
+        .expect("expected a terminal");
+        if !asked_for.is_empty() {
+            writer.send(asked_for.to_vec()).expect("expected a listener");
+            terminal.poll();
+        }
+        drop(writer);
+
+        terminal.encoder.set_options_from_terminal(&terminal.emulator);
+        let mut out = Vec::new();
+        terminal
+            .encode_key(key, mods, text.map(str::to_string), false, &mut out)
+            .expect("expected the keystroke to encode");
+        out
+    }
+
+    /// The `;5D` bug: readline binds none of `ESC [ 1 ; 5 D`, so ⌃← used to type the tail of
+    /// it into the prompt. What a shell is sent is the escape it already means by it.
+    #[test]
+    fn the_editing_chords_are_sent_as_what_a_shell_binds() {
+        assert_eq!(
+            legacy_editing_chord(key::Key::ArrowLeft, key::Mods::CTRL),
+            Some(b"\x1bb".as_slice())
+        );
+        assert_eq!(
+            legacy_editing_chord(key::Key::ArrowRight, key::Mods::CTRL),
+            Some(b"\x1bf".as_slice())
+        );
+        assert_eq!(
+            legacy_editing_chord(key::Key::ArrowLeft, key::Mods::SUPER),
+            Some(b"\x01".as_slice())
+        );
+    }
+
+    /// Only those chords, and only on their own: everything else is left to the encoder, which
+    /// is what knows about application cursor keys and the rest.
+    #[test]
+    fn every_other_key_is_left_to_the_encoder() {
+        assert_eq!(legacy_editing_chord(key::Key::ArrowLeft, key::Mods::empty()), None);
+        assert_eq!(legacy_editing_chord(key::Key::ArrowUp, key::Mods::CTRL), None);
+        assert_eq!(legacy_editing_chord(key::Key::A, key::Mods::CTRL), None);
+        // Shift held as well is a selection in whatever reads it, not a word motion.
+        assert_eq!(
+            legacy_editing_chord(key::Key::ArrowLeft, key::Mods::CTRL | key::Mods::SHIFT),
+            None
+        );
+    }
+
+    /// And a program that asked to read chords itself gets the real one — which is why ⌃←
+    /// already worked in claude while a shell was typing `;5D`.
+    #[test]
+    fn a_program_that_asked_for_the_kitty_protocol_reads_the_chord_itself() {
+        let (writer, output) = mpsc::channel();
+        let mut terminal = Terminal::new(TtyStream {
+            output,
+            tty: Arc::new(Recorder::default()) as Arc<dyn Tty>,
+        })
+        .expect("expected a terminal");
+
+        assert!(
+            !terminal.reads_the_real_chord(),
+            "a shell asks for nothing, and is sent what it binds"
+        );
+
+        writer
+            .send(b"\x1b[>1u".to_vec())
+            .expect("expected a listener");
+        terminal.poll();
+
+        assert!(
+            terminal.reads_the_real_chord(),
+            "a program that turned the protocol on should be sent the chord"
+        );
+    }
+
+    #[test]
+    fn a_plain_letter_is_sent_as_itself() {
+        assert_eq!(encoded(key::Key::A, key::Mods::empty(), Some("a")), b"a");
+    }
+
+    #[test]
+    fn a_shifted_letter_is_sent_as_the_capital() {
+        assert_eq!(encoded(key::Key::A, key::Mods::SHIFT, Some("A")), b"A");
+    }
+
+    /// Shift and the slash key is a question mark, and a program that reads `/` instead of `?`
+    /// puts the user in a menu they did not ask for.
+    #[test]
+    fn shifted_punctuation_is_sent_as_the_character_it_types() {
+        assert_eq!(encoded(key::Key::Slash, key::Mods::SHIFT, Some("?")), b"?");
+    }
+
+    /// What claude and friends turn on. The protocol reports the key that was pressed rather
+    /// than the character it typed, so a key whose character came out of shift has to say so —
+    /// otherwise `?` arrives as "the `/` key, with shift", and a program reads `/`.
+    #[test]
+    fn the_kitty_protocol_still_sends_the_character_that_was_typed() {
+        let bytes = encoded_with(key::Key::Slash, key::Mods::SHIFT, Some("?"), b"\x1b[>1u");
+
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "?",
+            "a question mark should reach the program as a question mark"
+        );
+    }
+
+    /// Every character that only exists with shift held goes the same way as `?`: the digits
+    /// row is where most of them live.
+    #[test]
+    fn the_shifted_characters_of_the_number_row_survive_the_kitty_protocol() {
+        for (key, unshifted, typed) in [
+            (key::Key::Digit9, '9', "("),
+            (key::Key::Digit0, '0', ")"),
+            (key::Key::Digit1, '1', "!"),
+            (key::Key::Digit8, '8', "*"),
+            (key::Key::Minus, '-', "_"),
+            (key::Key::Equal, '=', "+"),
+        ] {
+            let _ = unshifted;
+            let bytes = encoded_with(key, key::Mods::SHIFT, Some(typed), b"\x1b[>1u");
+
+            assert_eq!(
+                String::from_utf8_lossy(&bytes),
+                typed,
+                "{typed} should reach the program as itself"
+            );
+        }
+    }
+
+    /// The same protocol still has to report shift when it did not make the character, or a
+    /// program loses shift-tab and friends.
+    #[test]
+    fn the_kitty_protocol_still_reports_shift_when_it_typed_nothing() {
+        let bytes = encoded_with(key::Key::Tab, key::Mods::SHIFT, None, b"\x1b[>1u");
+
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        assert!(text.contains(";2"), "shift should still be reported: {text:?}");
+    }
+
+    #[test]
+    fn a_control_combo_is_a_command_rather_than_text() {
+        assert_eq!(encoded(key::Key::C, key::Mods::CTRL, None), b"\x03");
+    }
+
+    // ------------------------------------------------------------------------
+    // Mouse reports: the program's pointer when it turned mouse tracking on,
+    // gone through `encode_mouse_report`, which is what `handle_pointer`
+    // calls for every event once it has decided the program answered its
+    // own mouse.
+    // ------------------------------------------------------------------------
+
+    /// A widget wired to a recorder, with whatever the program enabled parsed in.
+    fn mouse_widget(with: &[u8]) -> (Terminal, Arc<Recorder>) {
+        let (writer, output) = mpsc::channel();
+        let recorder = Arc::new(Recorder::default());
+        let mut terminal = Terminal::new(TtyStream {
+            output,
+            tty: Arc::clone(&recorder) as Arc<dyn Tty>,
+        })
+        .expect("expected a terminal");
+        if !with.is_empty() {
+            writer.send(with.to_vec()).expect("expected a listener");
+            terminal.poll();
+        }
+        drop(writer);
+        (terminal, recorder)
+    }
+
+    /// One report in the tests' geometry: an 8x16 cell over a 2pt padding, so
+    /// surface (16, 18) is terminal cell column 1, row 1 — SGR cell (2, 2).
+    fn mouse_report(
+        terminal: &mut Terminal,
+        action: mouse::Action,
+        button: Option<mouse::Button>,
+        at: (f32, f32),
+        mods: key::Mods,
+    ) {
+        terminal.encode_mouse_report(
+            action,
+            button,
+            at,
+            vec2(8.0, 16.0),
+            2.0,
+            mods,
+            true,
+        );
+    }
+
+    /// Everything the widget has written the program since the last read.
+    fn mouse_sent(recorder: &Arc<Recorder>) -> Vec<u8> {
+        recorder.0.lock().unwrap().split_off(0)
+    }
+
+    /// A plain left click against a program that enabled SGR mouse reporting: the
+    /// press arrives as `CSI < 0 ; col ; row M` in one-based grid cells.
+    #[test]
+    fn a_click_reaches_a_mouse_tracking_program_as_sgr() {
+        let (mut terminal, recorder) =
+            mouse_widget(b"\x1b[?1000h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Press, Some(mouse::Button::Left), (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&recorder), b"\x1b[<0;2;2M");
+    }
+
+    /// The release the same gesture ends with uses the calculator-ish `m` terminator,
+    /// which is what tells press from release in the SGR format.
+    #[test]
+    fn a_release_terminates_the_sgr_report_with_an_m() {
+        let (mut terminal, recorder) =
+            mouse_widget(b"\x1b[?1000h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Release, Some(mouse::Button::Left), (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&recorder), b"\x1b[<0;2;2m");
+    }
+
+    /// Without tracking on, a pointer event is the widget's to select with, not the
+    /// program's news at all.
+    #[test]
+    fn nothing_reaches_a_program_that_never_asked() {
+        let (mut terminal, recorder) = mouse_widget(b"");
+        mouse_report(&mut terminal, mouse::Action::Press, Some(mouse::Button::Left), (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&recorder), b"");
+    }
+
+    /// Press/release mode wants press and release: motion gets swallowed, which is
+    /// what keeps a dragging pointer from flooding a program that only clicks.
+    #[test]
+    fn motion_is_silent_while_the_program_asks_for_presses_only() {
+        let (mut terminal, recorder) =
+            mouse_widget(b"\x1b[?1000h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Motion, None, (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&recorder), b"");
+    }
+
+    /// Button-event tracking reports motion under a held button, flagged with the
+    /// motion bit (32) on top of the button's own code — and takes none of it from a
+    /// pointer that is over the program with thumbs elsewhere.
+    #[test]
+    fn motion_reaches_button_event_tracking_with_a_button() {
+        let (mut terminal, recorder) =
+            mouse_widget(b"\x1b[?1002h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Motion, Some(mouse::Button::Left), (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&recorder), b"\x1b[<32;2;2M");
+    }
+
+    /// The same mode is silent for a motion with no button down: the program asked
+    /// to hear about moves of a hand with a button on it, not of hovering.
+    #[test]
+    fn motion_with_no_button_is_silent_in_button_event_tracking() {
+        let (mut terminal, recorder) =
+            mouse_widget(b"\x1b[?1002h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Motion, None, (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&recorder), b"");
+    }
+
+    /// Any-event tracking reports hovering too: no button held encodes as button
+    /// three, plus the motion bit.
+    #[test]
+    fn motion_in_any_event_tracking_reports_the_hovered_cell() {
+        let (mut terminal, recorder) =
+            mouse_widget(b"\x1b[?1003h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Motion, None, (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&recorder), b"\x1b[<35;2;2M");
+    }
+
+    /// Held modifiers ride along in the button code, so a ctrl-click and a plain
+    /// click stay apart for programs that tell one from the other.
+    #[test]
+    fn control_clicks_and_plain_clicks_arrive_as_different_button_codes() {
+        let (mut terminal, recorder) =
+            mouse_widget(b"\x1b[?1000h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Press, Some(mouse::Button::Left), (16.0, 18.0), key::Mods::CTRL);
+
+        assert_eq!(mouse_sent(&recorder), b"\x1b[<16;2;2M");
+    }
+
+    /// The wheel turns into buttons four (up) and five (down) at the cell under the
+    /// pointer, which is what a TUI reads its own scrollback from.
+    #[test]
+    fn the_wheel_reports_as_buttons_four_and_five() {
+        let (mut terminal, up_recorder) =
+            mouse_widget(b"\x1b[?1000h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Press, Some(mouse::Button::Four), (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&up_recorder), b"\x1b[<64;2;2M");
+
+        let (mut terminal, down_recorder) =
+            mouse_widget(b"\x1b[?1000h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Press, Some(mouse::Button::Five), (16.0, 18.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&down_recorder), b"\x1b[<65;2;2M");
+    }
+
+    /// A partial cell: the engine rounds the pointer into the cell it is *over*,
+    /// the one-based number a TUI computes its hotspot from.
+    #[test]
+    fn a_click_inside_a_cell_reports_that_cell() {
+        let (mut terminal, recorder) =
+            mouse_widget(b"\x1b[?1000h\x1b[?1006h");
+        mouse_report(&mut terminal, mouse::Action::Press, Some(mouse::Button::Left), (21.0, 40.0), key::Mods::empty());
+
+        assert_eq!(mouse_sent(&recorder), b"\x1b[<0;3;3M");
+    }
+}

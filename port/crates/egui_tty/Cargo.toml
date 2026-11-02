@@ -1,0 +1,21 @@
+[package]
+name = "egui_tty"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Antoine M-P"]
+description = "A terminal emulator widget for egui, drawn on top of Ghostty's VT engine"
+documentation = "https://docs.rs/egui_tty"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/antoineMoPa/egui_tty"
+
+[lib]
+name = "egui_tty"
+path = "src/lib.rs"
+
+[dependencies.egui]
+version = "0.36"
+
+[dependencies.libghostty-vt]
+version = "0.2.2"

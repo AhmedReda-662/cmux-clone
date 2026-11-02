@@ -1,0 +1,12 @@
+[package]
+name = "cmux-webview2"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+webview2-com = "0.39.1"
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }

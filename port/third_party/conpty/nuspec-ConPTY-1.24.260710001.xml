@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2011/08/nuspec.xsd">
+  <metadata>
+    <id>Microsoft.Windows.Console.ConPTY</id>
+    <version>1.24.260710001</version>
+    <authors>Microsoft</authors>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <license type="expression">MIT</license>
+    <licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>
+    <projectUrl>https://github.com/microsoft/terminal</projectUrl>
+    <description>This package allows applications to host Windows Console sessions. It should work on all versions of Windows 10.0.17763.0 and above.</description>
+    <copyright>© Microsoft Corporation</copyright>
+  </metadata>
+</package>

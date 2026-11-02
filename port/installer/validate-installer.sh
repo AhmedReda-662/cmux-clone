@@ -42,9 +42,9 @@ if command -v msiexec.exe &> /dev/null; then
         "cmux-shell.exe"
         "conpty.dll"
         "OpenConsole.exe"
-        "cmux-cli.exe"
+        "cmux.exe"
         "cmux.json.template"
-        "LICENSE"
+        "NOTICES.txt"
     )
     
     for file in "${REQUIRED[@]}"; do

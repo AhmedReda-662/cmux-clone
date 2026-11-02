@@ -1,0 +1,30 @@
+[package]
+name = "cmux-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cmux-pty-port = { path = "../cmux-pty-port" }
+cmux-layout = { path = "../cmux-layout" }
+cmux-config = { path = "../cmux-config" }
+cmux-workspaces = { path = "../cmux-workspaces" }
+cmux-toast = { path = "../cmux-toast" }
+cmux-ipc = { path = "../cmux-ipc" }
+cmux-hooks = { path = "../cmux-hooks" }
+cmux-webview2 = { path = "../cmux-webview2" }
+serde_json = "1"
+base64 = "0.22"
+egui_tty = "0.2"
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
+portable-pty = "0.8.1"
+anyhow = "1"
+raw-window-handle = "0.6"
+# Row-12 runtime services: process-tree walks (ToolHelp) + TCP listener
+# enumeration (IpHelper); socket constants from WinSock.
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
+  "Win32_System_Diagnostics_ToolHelp",
+] }

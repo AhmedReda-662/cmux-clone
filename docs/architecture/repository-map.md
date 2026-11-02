@@ -409,3 +409,32 @@ snapshot)*.
   with the marker-retirement predicates; live census cmux_live_11:
   on-token 97.02%, strip info-blue 0 px, drift vs live_10 entirely
   inside the strip band.
+
+## 6. Port packaging (landed M6, 2026-11-01)
+
+The distributable artifact layer lives outside the crates:
+
+- **`port/installer/`** — the WiX MSI recipe: `cmux-installer.wxs`
+  (perMachine x64 `ProgramFiles64Folder\cmux`, `WixUI_Minimal`,
+  UpgradeCode `{5A3C8F2E-7B4D-4A1F-9E6C-2D8F1A7B3C9D}`, version guards
+  matching the workspace `0.0.1`), `build-installer.ps1` /
+  `build-installer.sh` (candle `-arch x64` + light with
+  `WixUIExtension`; zero staging copies into tracked dirs), and
+  `validate-installer.ps1` (msiexec administrative extraction of the six
+  payload files). The package ships `cmux.exe` under its crate-declared
+  bin name (the hooks ownership rules match `\cmux.exe`; the earlier
+  `cmux-cli.exe` specs were wrong) plus `NOTICES.txt` (third-party
+  notices only — the port's own license is an open owner item) and
+  `cmux.json.template`.
+- **`port/third_party/conpty/`** — Microsoft's redistributable
+  ConPTY pair (NuGet `Microsoft.Windows.Console.ConPTY`
+  1.24.260710001, MIT; conpty.dll 109,920 B + OpenConsole.exe
+  1,066,296 B, x64, unmodified; manifest `.nuspec` checked in).
+  `cmux-shell/build.rs` stages the pair next to the profile exes so
+  portable-pty's sideload path picks it up; the MSI ships the same pair
+  into `Program Files\cmux`. Provenance, layout rule and receipts:
+  `ORIGIN.md`; decision: ADR-0017.
+- Machine receipts (2026-11-01): 5.43 MB MSI built with zero ICE/compile
+  errors; six payload files validated by administrative extraction;
+  toolchain locations and gotchas in
+  `docs/development/building-windows.md` (Installer toolchain section).

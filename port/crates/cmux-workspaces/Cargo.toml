@@ -1,0 +1,11 @@
+[package]
+name = "cmux-workspaces"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: the writer is compiled with ryu so every f64 (created_at
+# timestamps, divider fractions) re-decodes to the exact same value —
+# byte-equal skip logic and backup rotation depend on stable round-trips.
+serde_json = { version = "1", features = ["float_roundtrip"] }

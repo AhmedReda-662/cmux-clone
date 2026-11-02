@@ -1,0 +1,6 @@
+[package]
+name = "cmux-testsupport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

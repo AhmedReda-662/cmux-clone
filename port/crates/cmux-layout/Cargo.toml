@@ -1,0 +1,10 @@
+[package]
+name = "cmux-layout"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "Pane-tree split geometry (equalize/resize/spatial order), ported from cmux's CmuxPanes package"
+
+# Ported one-for-one from cmux-main/Packages/macOS/CmuxPanes (GPL-3.0-or-later).
+# Pure math over a snapshot tree: no OS, I/O, or UI code.
+[dependencies]

@@ -1,0 +1,16 @@
+[package]
+name = "cmux-cli"
+version.workspace = true
+edition.workspace = true
+
+# The product binary name mirrors the CLI surface (`cmux …`, upstream
+# `CLI/cmux.swift`); the ownership rules in cmux-hooks classify commands by
+# `\cmux.exe` in their text, so the exe name is load-bearing.
+[[bin]]
+name = "cmux"
+path = "src/main.rs"
+
+[dependencies]
+cmux-ipc = { path = "../cmux-ipc" }
+cmux-hooks = { path = "../cmux-hooks" }
+serde_json = "1"
