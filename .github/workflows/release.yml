@@ -1,0 +1,90 @@
+name: release
+
+# Tag-driven MSI release: gate the port, build the WiX MSI, validate it,
+# and attach it to the GitHub Release for the pushed tag.
+#
+# Mirror of the machine-verified recipe in docs/development/building-windows.md
+# (2026-11-01 receipts). Keep version pins in sync with that file.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: "0.15.2"
+  WIX_URL: https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+
+jobs:
+  msi:
+    name: gates + MSI + release asset (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, MSVC)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+          .\rustup-init.exe -y --default-toolchain stable-x86_64-pc-windows-msvc --profile minimal
+          Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+
+      - name: Install Zig ${{ env.ZIG_VERSION }} under C:\ (must not share a drive letter with the project: libghostty-rs#9)
+        shell: pwsh
+        run: |
+          $meta = Invoke-RestMethod https://ziglang.org/download/index.json
+          $entry = $meta.PSObject.Properties[$env:ZIG_VERSION].Value.'x86_64-windows'
+          Invoke-WebRequest -Uri $entry.tarball -OutFile zig.zip
+          Expand-Archive -Path zig.zip -DestinationPath C:\ -Force
+          Add-Content $env:GITHUB_PATH ("C:\zig-windows-$env:ZIG_VERSION")
+          zig version
+
+      - name: Install WiX 3.14 (portable, per the owner's tooling policy)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:WIX_URL -OutFile wix314-binaries.zip
+          Expand-Archive -Path wix314-binaries.zip -DestinationPath C:\wix314 -Force
+          Add-Content $env:GITHUB_PATH 'C:\wix314'
+          candle.exe -? | Select-Object -First 2
+
+      - name: Format check
+        working-directory: port
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (-D warnings)
+        working-directory: port
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Workspace tests
+        working-directory: port
+        run: cargo test --workspace
+
+      - name: egui_tty tests (separate lane: patched crate is outside the workspace members)
+        working-directory: port
+        run: cargo test -p egui_tty
+
+      - name: Release build
+        working-directory: port
+        run: cargo build --release
+
+      - name: Build the MSI
+        working-directory: port
+        run: .\installer\build-installer.ps1
+
+      - name: Validate the MSI
+        working-directory: port
+        run: .\installer\validate-installer.ps1 -MsiPath .\target\installer\cmux-installer.msi
+
+      - name: Attach the MSI to the release for this tag
+        working-directory: port
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "cmux-installer-$($env:GITHUB_REF_NAME).msi"
+          Copy-Item .\target\installer\cmux-installer.msi "$env:GITHUB_WORKSPACE\$asset" -Force
+          gh release create "$($env:GITHUB_REF_NAME)" "$env:GITHUB_WORKSPACE\$asset" `
+            --title "cmux $($env:GITHUB_REF_NAME)" --generate-notes --verify-tag
