@@ -1,60 +1,83 @@
 name: release
 
-# Tag-driven MSI release: gate the port, build the WiX MSI, validate it,
-# and attach it to the GitHub Release for the pushed tag.
+# Tag-driven MSI release: run the port's gates, build the WiX MSI, validate
+# it, and attach it to the GitHub Release for the pushed tag.
 #
-# Mirror of the machine-verified recipe in docs/development/building-windows.md
-# (2026-11-01 receipts). Keep version pins in sync with that file.
+# Machine-verified recipe: docs/development/building-windows.md (2026-11-01
+# receipts); keep the version pins in sync with that file.
+#
+# workflow_dispatch lets the owner rehearse gates + build + validation on
+# main without publishing - the release step runs only on tag pushes.
+#
+# YAML rules learned from the first revision being rejected at rest (startup
+# failure, zero jobs): a plain-scalar step name must not contain a colon
+# followed by a space; expressions are kept out of names; PATH entries
+# written in one step are only visible to later steps; and the zig zip
+# extracts an inner zig-x86_64-windows-<version> directory (never assume
+# zig-windows-<version>), so the path is detected, not assumed.
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
   ZIG_VERSION: "0.15.2"
-  WIX_URL: https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+  WIX_URL: "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
 
 jobs:
   msi:
-    name: gates + MSI + release asset (windows-latest)
+    name: Gates then MSI then release asset
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable, MSVC)
+      - name: Install Rust stable MSVC minimal
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
           .\rustup-init.exe -y --default-toolchain stable-x86_64-pc-windows-msvc --profile minimal
+          & "$env:USERPROFILE\.cargo\bin\rustup.exe" component add rustfmt clippy
           Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
 
-      - name: Install Zig ${{ env.ZIG_VERSION }} under C:\ (must not share a drive letter with the project: libghostty-rs#9)
+      - name: Verify cargo on PATH
+        shell: pwsh
+        run: cargo --version
+
+      - name: Install Zig under C drive (zig must not share a drive letter with the repo)
         shell: pwsh
         run: |
           $meta = Invoke-RestMethod https://ziglang.org/download/index.json
           $entry = $meta.PSObject.Properties[$env:ZIG_VERSION].Value.'x86_64-windows'
           Invoke-WebRequest -Uri $entry.tarball -OutFile zig.zip
-          Expand-Archive -Path zig.zip -DestinationPath C:\ -Force
-          Add-Content $env:GITHUB_PATH ("C:\zig-windows-$env:ZIG_VERSION")
-          zig version
+          Expand-Archive -Path zig.zip -DestinationPath C:\zig -Force
+          $inner = (Get-ChildItem C:\zig -Directory | Select-Object -First 1).FullName
+          Add-Content $env:GITHUB_PATH $inner
 
-      - name: Install WiX 3.14 (portable, per the owner's tooling policy)
+      - name: Verify zig on PATH
+        shell: pwsh
+        run: zig version
+
+      - name: Install WiX 3.14 portable
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri $env:WIX_URL -OutFile wix314-binaries.zip
           Expand-Archive -Path wix314-binaries.zip -DestinationPath C:\wix314 -Force
-          Add-Content $env:GITHUB_PATH 'C:\wix314'
-          candle.exe -? | Select-Object -First 2
+          Add-Content $env:GITHUB_PATH "C:\wix314"
+
+      - name: Verify WiX on PATH
+        shell: pwsh
+        run: Get-Command candle.exe, light.exe | Format-Table Name, Source
 
       - name: Format check
         working-directory: port
         run: cargo fmt --all -- --check
 
-      - name: Clippy (-D warnings)
+      - name: Clippy with warnings as errors
         working-directory: port
         run: cargo clippy --all-targets -- -D warnings
 
@@ -62,7 +85,7 @@ jobs:
         working-directory: port
         run: cargo test --workspace
 
-      - name: egui_tty tests (separate lane: patched crate is outside the workspace members)
+      - name: egui_tty tests (separate lane, patched crate is not a workspace member)
         working-directory: port
         run: cargo test -p egui_tty
 
@@ -79,12 +102,17 @@ jobs:
         run: .\installer\validate-installer.ps1 -MsiPath .\target\installer\cmux-installer.msi
 
       - name: Attach the MSI to the release for this tag
+        if: startsWith(github.ref, 'refs/tags/')
         working-directory: port
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $asset = "cmux-installer-$($env:GITHUB_REF_NAME).msi"
+          $tag = $env:GITHUB_REF_NAME
+          $asset = "cmux-installer-$tag.msi"
           Copy-Item .\target\installer\cmux-installer.msi "$env:GITHUB_WORKSPACE\$asset" -Force
-          gh release create "$($env:GITHUB_REF_NAME)" "$env:GITHUB_WORKSPACE\$asset" `
-            --title "cmux $($env:GITHUB_REF_NAME)" --generate-notes --verify-tag
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag "$env:GITHUB_WORKSPACE\$asset" --clobber
+          } else {
+            gh release create $tag "$env:GITHUB_WORKSPACE\$asset" --title "cmux $tag" --generate-notes --verify-tag
+          }
